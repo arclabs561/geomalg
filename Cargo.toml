@@ -1,0 +1,20 @@
+[package]
+name = "geomalg"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Geometric algebra primitives: multivectors, geometric product, grade projection, and rotor actions"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/arclabs561/geomalg"
+homepage = "https://docs.rs/geomalg"
+documentation = "https://docs.rs/geomalg"
+readme = "README.md"
+keywords = ["geometric-algebra", "multivector", "rotor", "clifford", "math"]
+categories = ["mathematics", "science"]
+include = ["/src", "/README.md", "/CHANGELOG.md", "/LICENSE*"]
+
+[workspace]
+
+[dependencies]
+
+[dev-dependencies]
