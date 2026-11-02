@@ -18,3 +18,10 @@ include = ["/src", "/README.md", "/CHANGELOG.md", "/LICENSE*"]
 [dependencies]
 
 [dev-dependencies]
+
+# The harness is a plain `Instant` loop so CI logs carry ns/op with no
+# criterion/dependency churn. `test = false` keeps it out of `cargo test`.
+[[bench]]
+name = "product"
+harness = false
+test = false

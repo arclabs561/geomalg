@@ -31,9 +31,163 @@
 
 use std::fmt;
 use std::ops;
+use std::sync::OnceLock;
 
 /// Maximum number of basis vectors supported by the `usize` blade bitmask.
 const MAX_DIM: usize = 63;
+
+/// Blade counts at or below this use the unrolled, fixed-size product kernel.
+/// 64 blades is `Cl(6, 0)`, well past the dimensions this crate is used at.
+const STACK_BLADES: usize = 64;
+
+/// Number of `(P, Q)` cache slots. `P + Q <= 63` bounds both keys by 63, so the
+/// slot index `P * 64 + Q` is unique and in range.
+const TABLE_SLOTS: usize = 64 * 64;
+
+/// Precomputed blade-product signs for one metric signature.
+///
+/// Every `Cl::<P, Q>` product needs the sign and resulting blade of each blade
+/// pair. Computing them per term dominated the product; a table built once per
+/// signature makes the product a single pass over the non-zero coefficients.
+///
+/// Get the table for a signature with [`Cl::table`] and reuse it with
+/// [`Cl::geometric_with`] when a loop performs many products:
+///
+/// ```
+/// use geomalg::Cl;
+///
+/// let table = Cl::<2, 0>::table();
+/// let a = Cl::<2, 0>::basis(0);
+/// let b = Cl::<2, 0>::basis(1);
+/// assert_eq!(a.geometric_with(&b, table), a.geometric(&b));
+/// ```
+pub struct ProductTable {
+    positive: usize,
+    negative: usize,
+    blade_count: usize,
+    /// `signs[a * n + mask]` is the `+/-1` sign of blade `a` times blade
+    /// `a ^ mask`. Storing by *result* mask keeps the hot loop's writes
+    /// contiguous.
+    signs: Box<[f64]>,
+}
+
+impl ProductTable {
+    fn build<const P: usize, const Q: usize>() -> Self {
+        let n = 1usize << (P + Q);
+        let mut signs = vec![0.0; n * n];
+        for a in 0..n {
+            for b in 0..n {
+                let (mask, sign) = Cl::<P, Q>::blade_product(a, b);
+                signs[a * n + mask] = sign;
+            }
+        }
+        Self {
+            positive: P,
+            negative: Q,
+            blade_count: n,
+            signs: signs.into_boxed_slice(),
+        }
+    }
+
+    /// The metric signature this table was built for.
+    pub fn signature(&self) -> (usize, usize) {
+        (self.positive, self.negative)
+    }
+
+    /// Number of basis blades, `2^(P + Q)`.
+    pub fn blade_count(&self) -> usize {
+        self.blade_count
+    }
+
+    #[inline]
+    fn matches<const P: usize, const Q: usize>(&self) -> bool {
+        self.positive == P && self.negative == Q
+    }
+
+    /// Accumulate `a * b` into the already-zeroed `out`.
+    ///
+    /// The summation order is the reference order: `a` ascending, then `b`
+    /// ascending, with each term evaluated as `(sign * a_i) * b_j`. A given
+    /// output blade is reached by exactly one `b` index per `a` index, so
+    /// walking the result blade instead of `b` keeps that order intact.
+    #[inline]
+    fn accumulate(&self, a: &[f64], b: &[f64], out: &mut [f64]) {
+        // A right operand with no zero coefficient needs no per-term test, and
+        // the fixed-size kernels then keep the accumulator in registers.
+        if b.iter().all(|&value| value != 0.0) {
+            match self.blade_count {
+                4 => self.dense::<4>(a, b, out),
+                8 => self.dense::<8>(a, b, out),
+                16 => self.dense::<16>(a, b, out),
+                32 => self.dense::<32>(a, b, out),
+                _ => self.sparse(a, b, out),
+            }
+        } else {
+            self.sparse(a, b, out);
+        }
+    }
+
+    /// Fully inlined product for a small, fully non-zero right operand.
+    ///
+    /// The loops are bounded by the constant `N`, so the indices and the
+    /// `k ^ i` gather fold to constants, the accumulator stays in registers,
+    /// and the destructuring below removes the per-term bounds checks.
+    #[inline]
+    fn dense<const N: usize>(&self, a: &[f64], b: &[f64], out: &mut [f64]) {
+        let (Some(a), Some(b), Some(out)) = (fixed::<N>(a), fixed::<N>(b), fixed_mut::<N>(out))
+        else {
+            return;
+        };
+        let mut acc = [0.0f64; N];
+        for i in 0..N {
+            let ai = a[i];
+            if ai == 0.0 {
+                continue;
+            }
+            let row = &self.signs[i * N..i * N + N];
+            for k in 0..N {
+                acc[k] += row[k] * ai * b[k ^ i];
+            }
+        }
+        out.copy_from_slice(&acc);
+    }
+
+    /// General product: skips zero coefficients on both sides.
+    fn sparse(&self, a: &[f64], b: &[f64], out: &mut [f64]) {
+        let n = self.blade_count;
+        for (i, &ai) in a.iter().enumerate() {
+            if ai == 0.0 {
+                continue;
+            }
+            let row = &self.signs[i * n..i * n + n];
+            for (j, &bj) in b.iter().enumerate() {
+                if bj == 0.0 {
+                    continue;
+                }
+                let k = i ^ j;
+                out[k] += row[k] * ai * bj;
+            }
+        }
+    }
+}
+
+/// One cache slot per signature. A `static` inside a generic function would be
+/// shared by every signature, so the cache is a fixed array indexed by the
+/// signature instead.
+static TABLES: [OnceLock<ProductTable>; TABLE_SLOTS] = [const { OnceLock::new() }; TABLE_SLOTS];
+
+/// Convert a slice to a fixed-size reference, or `None` when the length is
+/// wrong. Used once per product call, never per term.
+#[inline]
+fn fixed<const N: usize>(slice: &[f64]) -> Option<&[f64; N]> {
+    slice.try_into().ok()
+}
+
+/// Mutable counterpart of [`fixed`].
+#[inline]
+fn fixed_mut<const N: usize>(slice: &mut [f64]) -> Option<&mut [f64; N]> {
+    slice.try_into().ok()
+}
 
 /// A real multivector in the Clifford algebra `Cl(P, Q)`.
 ///
@@ -188,26 +342,89 @@ impl<const P: usize, const Q: usize> Cl<P, Q> {
         }
     }
 
+    /// The precomputed blade product table for this signature, built once and
+    /// shared by every value of the type.
+    ///
+    /// Pass it to [`Cl::geometric_with`] when a loop performs many products, so
+    /// the table is not looked up per product.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `P + Q > 63`, as [`Cl::blade_count`] does.
+    pub fn table() -> &'static ProductTable {
+        let dim = P + Q;
+        assert!(
+            dim <= MAX_DIM,
+            "Cl(P, Q) supports at most {MAX_DIM} basis vectors, got {dim}"
+        );
+        TABLES[P * 64 + Q].get_or_init(ProductTable::build::<P, Q>)
+    }
+
     /// The full geometric product `self * other`.
     ///
     /// Blades are multiplied one pair at a time, with the sign coming from the
     /// permutation that sorts the concatenated vectors and from the metric for
-    /// every vector that appears twice.
+    /// every vector that appears twice. The sign and resulting blade index of
+    /// each pair come from a table computed once per `(P, Q)`, so the product
+    /// is a single pass over the non-zero coefficients.
     pub fn geometric(&self, other: &Self) -> Self {
+        self.geometric_with(other, Self::table())
+    }
+
+    /// The full geometric product, using an explicit [`ProductTable`].
+    ///
+    /// Identical to [`Cl::geometric`], but a caller doing many products can
+    /// hoist the table lookup. The table must have been built for `Cl(P, Q)`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `table` belongs to a different signature.
+    pub fn geometric_with(&self, other: &Self, table: &ProductTable) -> Self {
+        assert!(
+            table.matches::<P, Q>(),
+            "product table is for Cl({}, {}), not Cl({P}, {Q})",
+            table.positive,
+            table.negative
+        );
         let mut out = Self::zero();
-        for (i, &a) in self.coeffs.iter().enumerate() {
-            if a == 0.0 {
-                continue;
-            }
-            for (j, &b) in other.coeffs.iter().enumerate() {
-                if b == 0.0 {
-                    continue;
-                }
-                let (index, sign) = Self::blade_product(i, j);
-                out.coeffs[index] += sign * a * b;
-            }
-        }
+        table.accumulate(&self.coeffs, &other.coeffs, &mut out.coeffs);
         out
+    }
+
+    /// The full geometric product `self * other`, written into `out`.
+    ///
+    /// Equivalent to `*out = self.geometric(other)` but reuses the allocation
+    /// already held by `out`, so a loop of products allocates nothing.
+    pub fn geometric_into(&self, other: &Self, out: &mut Self) {
+        out.coeffs.fill(0.0);
+        Self::table().accumulate(&self.coeffs, &other.coeffs, &mut out.coeffs);
+    }
+
+    /// Add `other` into `self` in place, without allocating.
+    pub fn add_assign(&mut self, other: &Self) {
+        for (lhs, &rhs) in self.coeffs.iter_mut().zip(&other.coeffs) {
+            *lhs += rhs;
+        }
+    }
+
+    /// Multiply every coefficient by `factor` in place, without allocating.
+    pub fn scale_assign(&mut self, factor: f64) {
+        for value in &mut self.coeffs {
+            *value *= factor;
+        }
+    }
+
+    /// Copy `a` into `out` with every blade reversed.
+    #[inline]
+    fn reverse_into(a: &[f64], out: &mut [f64]) {
+        for (index, (src, dst)) in a.iter().zip(out).enumerate() {
+            let grade = index.count_ones();
+            *dst = if (grade * grade.saturating_sub(1) / 2) % 2 == 1 {
+                -*src
+            } else {
+                *src
+            };
+        }
     }
 
     /// Reversal: reverse the vector order inside every blade.
@@ -215,12 +432,7 @@ impl<const P: usize, const Q: usize> Cl<P, Q> {
     /// A grade-`k` blade gains the sign `(-1)^(k(k - 1)/2)`.
     pub fn reverse(&self) -> Self {
         let mut out = self.clone();
-        for (index, value) in out.coeffs.iter_mut().enumerate() {
-            let grade = index.count_ones();
-            if (grade * grade.saturating_sub(1) / 2) % 2 == 1 {
-                *value = -*value;
-            }
-        }
+        Self::reverse_into(&self.coeffs, &mut out.coeffs);
         out
     }
 
@@ -273,8 +485,9 @@ impl<const P: usize, const Q: usize> Cl<P, Q> {
             "rotor needs two distinct plane basis vectors"
         );
 
-        let bivector = Self::basis(plane_a).geometric(&Self::basis(plane_b));
-        let square = bivector.geometric(&bivector).coeffs[0];
+        let (mask, sign) = Self::blade_product(1 << plane_a, 1 << plane_b);
+        // `(e_a e_b)^2` is a scalar, so its own table entry is the square.
+        let (_, square) = Self::blade_product(mask, mask);
         let t = -angle / 2.0;
 
         let (cos_part, sin_part) = if square < 0.0 {
@@ -287,7 +500,10 @@ impl<const P: usize, const Q: usize> Cl<P, Q> {
             (1.0, t)
         };
 
-        Self::scalar(cos_part).add(&bivector.scale(sin_part))
+        let mut out = Self::zero();
+        out.coeffs[0] = cos_part;
+        out.coeffs[mask] = sign * sin_part;
+        out
     }
 
     /// Sandwich action `self * v * reverse(self)`.
@@ -295,7 +511,24 @@ impl<const P: usize, const Q: usize> Cl<P, Q> {
     /// With a unit rotor this is a rotation; with a unit Pin it is a
     /// reflection or rotation-reflection.
     pub fn sandwich(&self, v: &Self) -> Self {
-        self.geometric(v).geometric(&self.reverse())
+        let n = self.coeffs.len();
+        let table = Self::table();
+        let mut out = Self::zero();
+        if n <= STACK_BLADES {
+            // The intermediate `self * v` and the reversal are scratch: only
+            // the result reaches the heap.
+            let mut mid = [0.0f64; STACK_BLADES];
+            let mut reversed = [0.0f64; STACK_BLADES];
+            let mid = &mut mid[..n];
+            let reversed = &mut reversed[..n];
+            table.accumulate(&self.coeffs, &v.coeffs, mid);
+            Self::reverse_into(&self.coeffs, reversed);
+            table.accumulate(mid, reversed, &mut out.coeffs);
+        } else {
+            let mid = self.geometric(v);
+            table.accumulate(&mid.coeffs, &self.reverse().coeffs, &mut out.coeffs);
+        }
+        out
     }
 
     /// Product of two basis blades: resulting blade index and `+/-1` sign.
@@ -407,6 +640,128 @@ impl<const P: usize, const Q: usize> fmt::Display for Cl<P, Q> {
 impl<const P: usize, const Q: usize> fmt::Debug for Cl<P, Q> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Cl<{P}, {Q}>({self})")
+    }
+}
+
+/// A rotor with its grade-1 action precomputed.
+///
+/// Applying a rotor to a vector is linear, so the sandwich product for each
+/// basis vector is computed once. [`Rotor::apply_vector`] then costs `N * N`
+/// multiply-adds instead of two geometric products.
+#[derive(Clone, Debug)]
+pub struct Rotor<const P: usize, const Q: usize> {
+    even: Cl<P, Q>,
+    action: Vec<f64>,
+}
+
+impl<const P: usize, const Q: usize> Rotor<P, Q> {
+    /// Builds the rotor for the `plane_a`/`plane_b` plane and precomputes its
+    /// action on grade-1 vectors.
+    ///
+    /// # Panics
+    ///
+    /// Panics under the same conditions as [`Cl::rotor`].
+    pub fn new(plane_a: usize, plane_b: usize, angle: f64) -> Self {
+        let even = Cl::<P, Q>::rotor(plane_a, plane_b, angle);
+        let n = P + Q;
+        let mut action = vec![0.0; n * n];
+        for j in 0..n {
+            let image = even.sandwich(&Cl::<P, Q>::basis(j));
+            for i in 0..n {
+                action[i * n + j] = image.coefficient(1 << i);
+            }
+        }
+        Self { even, action }
+    }
+
+    /// The normalized even multivector behind this rotor.
+    pub fn even(&self) -> &Cl<P, Q> {
+        &self.even
+    }
+
+    /// Applies the rotor to an arbitrary multivector via the sandwich product.
+    pub fn apply(&self, v: &Cl<P, Q>) -> Cl<P, Q> {
+        self.even.sandwich(v)
+    }
+
+    /// Applies the rotor to a grade-1 vector using the precomputed action.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `v.len() != P + Q`.
+    pub fn apply_vector(&self, v: &[f64]) -> Vec<f64> {
+        let n = P + Q;
+        assert_eq!(v.len(), n, "vector length must be P + Q");
+        let mut out = vec![0.0; n];
+        self.apply_vectors_into(v, &mut out);
+        out
+    }
+
+    /// Applies the rotor to `input.len() / N` vectors, writing to `out`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the lengths are not whole multiples of `P + Q` or differ.
+    pub fn apply_vectors(&self, input: &[f64], out: &mut [f64]) {
+        let n = P + Q;
+        assert_eq!(input.len() % n, 0, "input must hold whole vectors");
+        assert_eq!(out.len(), input.len(), "out must match input length");
+        for (src, dst) in input.chunks_exact(n).zip(out.chunks_exact_mut(n)) {
+            self.apply_vectors_into(src, dst);
+        }
+    }
+
+    fn apply_vectors_into(&self, src: &[f64], dst: &mut [f64]) {
+        let n = P + Q;
+        for (i, slot) in dst.iter_mut().enumerate() {
+            let row = &self.action[i * n..i * n + n];
+            *slot = row.iter().zip(src).map(|(a, b)| a * b).sum();
+        }
+    }
+}
+
+#[cfg(test)]
+mod rotor_tests {
+    use super::*;
+
+    #[test]
+    fn vector_action_matches_the_sandwich_product() {
+        let rotor = Rotor::<2, 0>::new(0, 1, std::f64::consts::FRAC_PI_3);
+        for v in [vec![1.0, 0.0], vec![0.0, 1.0], vec![0.7, -1.3]] {
+            let image = rotor.apply(&Cl::<2, 0>::vector(&v));
+            let actual = rotor.apply_vector(&v);
+            for (i, a) in actual.iter().enumerate() {
+                let b = image.coefficient(1 << i);
+                assert!((a - b).abs() < 1e-12, "component {i}: {a} != {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn batch_matches_the_single_call() {
+        let rotor = Rotor::<3, 1>::new(0, 1, 0.9);
+        let mut input = Vec::new();
+        for k in 0..16 {
+            for j in 0..4 {
+                input.push(((k * 4 + j) as f64 * 0.37).sin());
+            }
+        }
+        let mut out = vec![0.0; input.len()];
+        rotor.apply_vectors(&input, &mut out);
+        for (chunk_in, chunk_out) in input.chunks_exact(4).zip(out.chunks_exact(4)) {
+            let single = rotor.apply_vector(chunk_in);
+            for (a, b) in chunk_out.iter().zip(&single) {
+                assert!((a - b).abs() < 1e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn rotor_preserves_vector_norm() {
+        let rotor = Rotor::<2, 0>::new(0, 1, 1.1);
+        let out = rotor.apply_vector(&[3.0, 4.0]);
+        let norm = (out[0] * out[0] + out[1] * out[1]).sqrt();
+        assert!((norm - 5.0).abs() < 1e-12);
     }
 }
 
