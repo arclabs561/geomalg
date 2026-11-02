@@ -9,6 +9,12 @@ plain `f64`, one per basis blade, so a multivector is a value you can clone,
 compare, and pass across a boundary without a trait object or an allocator
 registry.
 
+## Install
+
+```toml
+geomalg = "0.1"
+```
+
 ```rust
 use geomalg::Cl;
 use std::f64::consts::FRAC_PI_2;
