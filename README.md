@@ -12,7 +12,7 @@ registry.
 ## Install
 
 ```toml
-geomalg = "0.1"
+geomalg = "0.1.2"
 ```
 
 ```rust
