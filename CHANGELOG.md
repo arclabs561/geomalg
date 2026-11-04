@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `Cl::exp_bivector`: the exponential of a simple bivector (pure grade 2,
+  square a scalar), with the trigonometric, hyperbolic and parabolic cases.
+  Returns `None` for other input. `Cl::rotor` is the coordinate-plane case.
+- `Rotor::from_even`: wraps any unit even multivector and precomputes its
+  grade-1 action, so rotors outside coordinate planes (a boost toward a
+  general direction, a product of rotors) get the fast `apply_vector` path.
+  Returns `None` for odd parts or `R * reverse(R) != 1`.
+
 ## 0.1.1
 
 ### Added
