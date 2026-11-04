@@ -506,6 +506,48 @@ impl<const P: usize, const Q: usize> Cl<P, Q> {
         out
     }
 
+    /// Exponential of a simple bivector: `exp(B)` for a pure grade-2 `B` whose
+    /// square is a scalar.
+    ///
+    /// `B^2 = s` gives `cos(sqrt(-s)) + sin(sqrt(-s)) / sqrt(-s) * B` for
+    /// `s < 0`, `cosh(sqrt(s)) + sinh(sqrt(s)) / sqrt(s) * B` for `s > 0`, and
+    /// `1 + B` for `s = 0`. With `B = -(angle / 2) * e_a e_b` this is
+    /// [`Cl::rotor`]; any other plane, such as a boost toward a general
+    /// direction, works the same way, which is how to build a rotor that is not
+    /// aligned with a coordinate plane.
+    ///
+    /// Returns `None` when `self` has parts outside grade 2, or when its square
+    /// is not a scalar (a non-simple bivector, possible from four dimensions
+    /// up). Both checks use a tolerance of `1e-12` relative to the bivector's
+    /// coefficient scale.
+    pub fn exp_bivector(&self) -> Option<Self> {
+        let scale = self.coeffs.iter().fold(0.0f64, |m, c| m.max(c.abs()));
+        let tol = 1e-12 * scale.max(1.0);
+        for (mask, &c) in self.coeffs.iter().enumerate() {
+            if mask.count_ones() != 2 && c.abs() > tol {
+                return None;
+            }
+        }
+        let square = self.geometric(self);
+        let square_tol = 1e-12 * (scale * scale).max(1.0);
+        if square.coeffs[1..].iter().any(|c| c.abs() > square_tol) {
+            return None;
+        }
+        let s = square.coeffs[0];
+        let (cos_part, sin_part) = if s < -square_tol {
+            let lambda = (-s).sqrt();
+            (lambda.cos(), lambda.sin() / lambda)
+        } else if s > square_tol {
+            let mu = s.sqrt();
+            (mu.cosh(), mu.sinh() / mu)
+        } else {
+            (1.0, 1.0)
+        };
+        let mut out = self.grade(2).scale(sin_part);
+        out.coeffs[0] = cos_part;
+        Some(out)
+    }
+
     /// Sandwich action `self * v * reverse(self)`.
     ///
     /// With a unit rotor this is a rotation; with a unit Pin it is a
@@ -662,7 +704,34 @@ impl<const P: usize, const Q: usize> Rotor<P, Q> {
     ///
     /// Panics under the same conditions as [`Cl::rotor`].
     pub fn new(plane_a: usize, plane_b: usize, angle: f64) -> Self {
-        let even = Cl::<P, Q>::rotor(plane_a, plane_b, angle);
+        Self::with_action(Cl::<P, Q>::rotor(plane_a, plane_b, angle))
+    }
+
+    /// Wraps any rotor multivector and precomputes its action on grade-1
+    /// vectors, for rotors that are not aligned with a coordinate plane (for
+    /// example [`Cl::exp_bivector`] of a general bivector, or a product of
+    /// rotors).
+    ///
+    /// Returns `None` unless `even` has only even-grade parts and
+    /// `even * reverse(even)` is `1` (both within `1e-9`).
+    pub fn from_even(even: Cl<P, Q>) -> Option<Self> {
+        let tol = 1e-9;
+        if even
+            .coeffs
+            .iter()
+            .enumerate()
+            .any(|(mask, c)| mask.count_ones() % 2 == 1 && c.abs() > tol)
+        {
+            return None;
+        }
+        let unit = even.geometric(&even.reverse());
+        if (unit.coeffs[0] - 1.0).abs() > tol || unit.coeffs[1..].iter().any(|c| c.abs() > tol) {
+            return None;
+        }
+        Some(Self::with_action(even))
+    }
+
+    fn with_action(even: Cl<P, Q>) -> Self {
         let n = P + Q;
         let mut action = vec![0.0; n * n];
         for j in 0..n {
@@ -754,6 +823,75 @@ mod rotor_tests {
                 assert!((a - b).abs() < 1e-12);
             }
         }
+    }
+
+    #[test]
+    fn exp_bivector_reproduces_coordinate_plane_rotors() {
+        for (a, b) in [(0, 1), (0, 2), (1, 2), (0, 3), (1, 3), (2, 3)] {
+            for angle in [-2.3, -0.4, 0.0, 0.7, 1.9] {
+                let (mask, sign) = Cl::<3, 1>::blade_product(1 << a, 1 << b);
+                let mut bivector = Cl::<3, 1>::zero();
+                bivector.coeffs[mask] = -sign * angle / 2.0;
+                let via_exp = bivector.exp_bivector().expect("simple bivector");
+                let direct = Cl::<3, 1>::rotor(a, b, angle);
+                for (x, y) in via_exp.coefficients().iter().zip(direct.coefficients()) {
+                    assert!((x - y).abs() < 1e-14, "plane ({a},{b}) angle {angle}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exp_bivector_rejects_non_bivectors_and_non_simple_ones() {
+        assert!(Cl::<3, 1>::vector(&[1.0, 0.0, 0.0, 0.0])
+            .exp_bivector()
+            .is_none());
+        // e1e2 + e3e4 squares to -2 + 2 e1e2e3e4, which is not a scalar.
+        let mut non_simple = Cl::<4, 0>::zero();
+        non_simple.coeffs[0b0011] = 1.0;
+        non_simple.coeffs[0b1100] = 1.0;
+        assert!(non_simple.exp_bivector().is_none());
+    }
+
+    #[test]
+    fn boost_toward_a_general_direction_from_even() {
+        // Boost by rapidity theta along u = (0.6, 0.8, 0) in Cl(3, 1), time = e4.
+        let theta = 0.9;
+        let (ux, uy) = (0.6, 0.8);
+        let mut bivector = Cl::<3, 1>::zero();
+        for (axis, weight) in [(0usize, ux), (1usize, uy)] {
+            let (mask, sign) = Cl::<3, 1>::blade_product(1 << axis, 1 << 3);
+            bivector.coeffs[mask] += -sign * weight * theta / 2.0;
+        }
+        let even = bivector.exp_bivector().expect("simple bivector");
+        let rotor = Rotor::from_even(even).expect("unit rotor");
+
+        let minkowski = |v: &[f64]| v[0] * v[0] + v[1] * v[1] + v[2] * v[2] - v[3] * v[3];
+        for v in [
+            vec![0.0, 0.0, 0.0, 1.0],
+            vec![0.3, -0.2, 0.5, 1.4],
+            vec![1.0, 0.0, 0.0, 0.0],
+        ] {
+            let out = rotor.apply_vector(&v);
+            let image = rotor.apply(&Cl::<3, 1>::vector(&v));
+            for (i, a) in out.iter().enumerate() {
+                assert!((a - image.coefficient(1 << i)).abs() < 1e-12);
+            }
+            assert!((minkowski(&out) - minkowski(&v)).abs() < 1e-12);
+        }
+        // The time axis goes to cosh(theta) in time and sinh(theta) along +/-u.
+        let t = rotor.apply_vector(&[0.0, 0.0, 0.0, 1.0]);
+        assert!((t[3] - theta.cosh()).abs() < 1e-12);
+        assert!((t[0].abs() - ux * theta.sinh()).abs() < 1e-12);
+        assert!((t[1].abs() - uy * theta.sinh()).abs() < 1e-12);
+        assert!(t[0] * t[1] > 0.0 && t[2].abs() < 1e-12);
+    }
+
+    #[test]
+    fn from_even_rejects_odd_and_non_unit_input() {
+        assert!(Rotor::<3, 1>::from_even(Cl::vector(&[1.0, 0.0, 0.0, 0.0])).is_none());
+        assert!(Rotor::<3, 1>::from_even(Cl::scalar(2.0)).is_none());
+        assert!(Rotor::<3, 1>::from_even(Cl::scalar(1.0)).is_some());
     }
 
     #[test]
