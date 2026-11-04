@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.1
+
+### Added
+
+- `ProductTable` and `Cl::table()`, with `geometric_with` and `geometric_into`
+  taking the table or a caller-supplied output buffer.
+- `Rotor` with a precomputed grade-1 action: `apply` for the sandwich product,
+  `apply_vector` for one vector and `apply_vectors` for a flat batch.
+
+### Changed
+
+- `geometric` uses the per-signature table and skips zero coefficients.
+  Release benchmarks: Cl(3,1) product 240 -> 145 ns, `geometric_into` 114 ns,
+  batched rotor action 9.0 ns per point (26.6 ns single).
+
 All notable changes to this project are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).

@@ -9,6 +9,12 @@ plain `f64`, one per basis blade, so a multivector is a value you can clone,
 compare, and pass across a boundary without a trait object or an allocator
 registry.
 
+## Install
+
+```toml
+geomalg = "0.1"
+```
+
 ```rust
 use geomalg::Cl;
 use std::f64::consts::FRAC_PI_2;
@@ -45,6 +51,24 @@ bitmasks, so `P + Q` is capped at 63, and the coefficient type is fixed to
 If a consumer needs conformal geometry, arbitrary signatures per value, or
 symbolic coefficients, that belongs in the consumer or in a later, separate
 crate. This crate stays a dense numeric multivector.
+
+## Performance
+
+Release build, `cargo bench --bench product`, best of five batches, Apple M3 Max
+(aarch64-apple-darwin, 16 cores), shared machine so compare ratios within a run
+rather than absolute values across days.
+
+| Operation | Cl(3,1) | Cl(2,0) |
+| --- | --- | --- |
+| `geometric` (dense × dense) | 145 ns | 35 ns |
+| `geometric_into` (dense) | 114 ns | 13 ns |
+| `Rotor::new` | 43 ns | 43 ns |
+| `Rotor::apply_vector`, one call | 27 ns/point | — |
+| `Rotor::apply_vectors`, batch of 1,000 | 9 ns/point | — |
+
+Not claimed: other CPU tiers, threads, cold caches, or a multi-machine
+comparison. Sparse inputs are slower than dense ones at Cl(3,1) (134 ns), because
+the zero check costs more than it saves at that size.
 
 ## Testing
 
